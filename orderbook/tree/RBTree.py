@@ -2,8 +2,8 @@
 from __future__ import annotations
 from graphviz import Digraph
 import uuid
-from tool.simpleStack import simpleStack
-from binaryTree.util import *
+from orderbook.utils.simpleStack import simpleStack
+from orderbook.tree.util import *
 
 import logging
 RBTree_logger = logging.getLogger(__name__)

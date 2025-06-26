@@ -18,12 +18,10 @@ import logging
 import akshare as ak  # pip install akshare
 
 from orderbook.core.axob import AXOB, AX_SIGNAL
-from orderbook.messages.order import axsbe_order
-from orderbook.messages.execution import axsbe_exe
-from orderbook.messages.snapshot import axsbe_snap_stock
-from orderbook.messages.base import SecurityIDSource_SZSE, SecurityIDSource_SSE, INSTRUMENT_TYPE
-
-
+from orderbook.messages.axsbe_order import axsbe_order
+from orderbook.messages.axsbe_exe import axsbe_exe
+from orderbook.messages.axsbe_snap_stock import axsbe_snap_stock
+from orderbook.messages.axsbe_base import SecurityIDSource_SZSE, SecurityIDSource_SSE, INSTRUMENT_TYPE, TPM
 class MarketDataFetcher:
     """市场数据获取器"""
     

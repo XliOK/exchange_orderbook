@@ -1,4 +1,4 @@
-from tool.simpleStack import simpleStack
+from orderbook.utils.simpleStack import simpleStack
 
 
 DBG_VIEW_ROOT = './log/binTreeView'
