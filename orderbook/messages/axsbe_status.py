@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import orderbook.messages as axsbe_base
+import orderbook.messages.axsbe_base as axsbe_base
 from orderbook.messages.axsbe_base import TPI, TPM
 import struct
 

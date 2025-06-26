@@ -279,7 +279,7 @@ class OrderBookAccuracyTest:
             order.setSide("买入")
             order.setType("限价")
             order.TransactTime = int(current_time.strftime('%Y%m%d%H%M%S%f')[:-3])
-            order.TradingPhaseMarket = ob.TradingPhaseMarket
+            #order.TradingPhaseMarket = ob.TradingPhaseMarket
             
             ob.onMsg(order)
             seq_num += 1
@@ -294,7 +294,7 @@ class OrderBookAccuracyTest:
             order.setSide("卖出")
             order.setType("限价")
             order.TransactTime = int(current_time.strftime('%Y%m%d%H%M%S%f')[:-3])
-            order.TradingPhaseMarket = ob.TradingPhaseMarket
+            #order.TradingPhaseMarket = ob.TradingPhaseMarket
             
             ob.onMsg(order)
             seq_num += 1
