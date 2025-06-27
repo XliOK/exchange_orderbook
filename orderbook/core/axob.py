@@ -21,6 +21,7 @@
 from enum import Enum
 from orderbook.utils.msg_util import CYB_cage_upper, CYB_cage_lower, bitSizeOf, MARKET_SUBTYPE, market_subtype
 import orderbook.utils.msg_util as msg_util
+from orderbook.messages import axsbe_base
 from orderbook.messages.axsbe_base import SecurityIDSource_SSE, SecurityIDSource_SZSE, INSTRUMENT_TYPE, MsgType_exe_sse_bond
 from orderbook.messages.axsbe_exe import axsbe_exe
 from orderbook.messages.axsbe_order import axsbe_order  
