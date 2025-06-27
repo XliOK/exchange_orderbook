@@ -214,7 +214,7 @@ class OrderBookAccuracyTest:
         self.test_results = []
         
     def create_orderbook(self, symbol: str) -> AXOB:
-        """创建订单簿"""
+        """创建订单簿（修复版）"""
         # 判断市场
         if symbol.startswith('sh'):
             security_id = int(symbol[2:])
@@ -225,82 +225,170 @@ class OrderBookAccuracyTest:
             
         ob = AXOB(security_id, source, INSTRUMENT_TYPE.STOCK)
         
-        # 初始化常量（从实时数据获取）
+        # 获取市场数据并初始化常量
         market_data = self.data_fetcher.get_realtime_quote_sina(symbol)
         if market_data:
             ob.constantValue_ready = True
-            ob.PrevClosePx = int(market_data['pre_close'] * 100)
             
-            # 计算涨跌停价
-            if symbol.startswith('sz300') or symbol.startswith('sh688'):
-                # 创业板/科创板 20%
-                ob.UpLimitPx = int(ob.PrevClosePx * 1.2)
-                ob.DnLimitPx = int(ob.PrevClosePx * 0.8)
-            else:
-                # 主板 10%
-                ob.UpLimitPx = int(ob.PrevClosePx * 1.1)
-                ob.DnLimitPx = int(ob.PrevClosePx * 0.9)
+            # 根据交易所类型设置价格精度
+            if source == SecurityIDSource_SZSE:
+                # 深交所：内部使用2位小数精度，快照前收盘价使用4位小数精度
+                ob.PrevClosePx = int(market_data['pre_close'] * 100)  # 内部2位小数
                 
-            ob.UpLimitPrice = ob.UpLimitPx
-            ob.DnLimitPrice = ob.DnLimitPx
+                # 涨跌停价格：深交所快照中使用6位小数，但这里先用4位小数计算再转换
+                if symbol.startswith('sz300'):
+                    # 创业板 20%
+                    up_limit_raw = market_data['pre_close'] * 1.2
+                    dn_limit_raw = market_data['pre_close'] * 0.8
+                else:
+                    # 主板/中小板 10%
+                    up_limit_raw = market_data['pre_close'] * 1.1
+                    dn_limit_raw = market_data['pre_close'] * 0.9
+                
+                # 深交所快照涨跌停价格使用6位小数精度
+                ob.UpLimitPx = int(up_limit_raw * 10000)  # 快照格式：6位小数（实际存储为4位小数*100）
+                ob.DnLimitPx = int(dn_limit_raw * 10000)
+                
+                # 内部计算用的涨跌停价格（2位小数精度）
+                ob.UpLimitPrice = int(up_limit_raw * 100)
+                ob.DnLimitPrice = int(dn_limit_raw * 100)
+                
+            else:
+                # 上交所：内部和快照都使用3位小数精度
+                ob.PrevClosePx = int(market_data['pre_close'] * 1000)  # 3位小数
+                
+                # 判断板块类型确定涨跌幅限制
+                if str(security_id).startswith('688'):
+                    # 科创板 20%
+                    up_limit_raw = market_data['pre_close'] * 1.2
+                    dn_limit_raw = market_data['pre_close'] * 0.8
+                elif str(security_id).startswith('68'):
+                    # 科创板其他代码 20%
+                    up_limit_raw = market_data['pre_close'] * 1.2
+                    dn_limit_raw = market_data['pre_close'] * 0.8
+                else:
+                    # 主板 10%
+                    up_limit_raw = market_data['pre_close'] * 1.1
+                    dn_limit_raw = market_data['pre_close'] * 0.9
+                
+                # 上交所涨跌停价格（3位小数精度）
+                ob.UpLimitPx = int(up_limit_raw * 1000)
+                ob.DnLimitPx = int(dn_limit_raw * 1000)
+                
+                # 内部计算用的涨跌停价格（与快照相同）
+                ob.UpLimitPrice = ob.UpLimitPx
+                ob.DnLimitPrice = ob.DnLimitPx
+            
+            # 设置日期
             ob.YYMMDD = int(datetime.now().strftime('%Y%m%d'))
+            
+            # 设置渠道号（模拟）
+            if source == SecurityIDSource_SZSE:
+                ob.ChannelNo = 2000  # 深交所逐笔渠道号示例
+            else:
+                ob.ChannelNo = 6     # 上交所渠道号示例
+                
+        else:
+            self.logger.warning(f"无法获取 {symbol} 的市场数据，使用默认参数")
+            # 设置默认参数，避免测试完全失败
+            ob.constantValue_ready = True
+            ob.PrevClosePx = 1000  # 默认10.00元
+            ob.UpLimitPx = 1100 if source == SecurityIDSource_SZSE else 11000
+            ob.DnLimitPx = 900 if source == SecurityIDSource_SZSE else 9000
+            ob.UpLimitPrice = 1100 if source == SecurityIDSource_SZSE else 11000
+            ob.DnLimitPrice = 900 if source == SecurityIDSource_SZSE else 9000
+            ob.YYMMDD = int(datetime.now().strftime('%Y%m%d'))
+            ob.ChannelNo = 2000 if source == SecurityIDSource_SZSE else 6
             
         return ob
     
     def simulate_orders_from_snapshot(self, ob: AXOB, snapshot: Dict):
-        """从快照数据模拟订单"""
-        # 设置交易阶段
+        """从快照数据模拟订单（完全修复版）"""
+        
+        # 1. 设置交易阶段信号
         current_time = datetime.now()
-        if current_time.hour < 9 or (current_time.hour == 9 and current_time.minute < 15):
-            ob.TradingPhaseMarket = TPM.Starting
-        elif current_time.hour == 9 and current_time.minute < 25:
-            ob.TradingPhaseMarket = TPM.OpenCall
-        elif current_time.hour == 9 and current_time.minute < 30:
-            ob.TradingPhaseMarket = TPM.PreTradingBreaking
-        elif (current_time.hour < 11 or (current_time.hour == 11 and current_time.minute < 30)):
-            ob.TradingPhaseMarket = TPM.AMTrading
-        elif current_time.hour < 13:
-            ob.TradingPhaseMarket = TPM.Breaking
-        elif current_time.hour < 14 or (current_time.hour == 14 and current_time.minute < 57):
-            ob.TradingPhaseMarket = TPM.PMTrading
-        elif current_time.hour == 14 and current_time.minute < 15:
-            ob.TradingPhaseMarket = TPM.CloseCall
-        else:
-            ob.TradingPhaseMarket = TPM.Ending
-            
-        # 模拟买单
+        if current_time.hour >= 9 and current_time.minute >= 30:
+            ob.onMsg(AX_SIGNAL.AMTRADING_BGN)  # 上午连续竞价
+        
+        # 2. 修复订单创建
         seq_num = 1
+        
+        # 生成正确格式的时间戳
+        if ob.SecurityIDSource == SecurityIDSource_SZSE:
+            # 深交所：YYYYMMDDHHMMSSsss 格式
+            timestamp = int(current_time.strftime('%Y%m%d%H%M%S')) * 1000 + current_time.microsecond // 1000
+        else:
+            # 上交所：HHMMSSSS 格式（精度到10毫秒）
+            timestamp = int(current_time.strftime('%H%M%S')) * 100 + (current_time.microsecond // 10000)
+        
+        # 模拟买单
         for i, bid_level in enumerate(snapshot['bid_levels']):
             order = axsbe_order(ob.SecurityIDSource)
             order.SecurityID = ob.SecurityID
             order.ApplSeqNum = seq_num
-            order.Price = int(bid_level['price'] * 100)
-            order.OrderQty = int(bid_level['volume'])
-            order.setSide("买入")
-            order.setType("限价")
-            order.TransactTime = int(current_time.strftime('%Y%m%d%H%M%S%f')[:-3])
-            #order.TradingPhaseMarket = ob.TradingPhaseMarket
+            
+            # 修复价格精度问题
+            if ob.SecurityIDSource == SecurityIDSource_SZSE:
+                # 深交所：确保价格是100的倍数
+                price_raw = int(bid_level['price'] * 10000)  # 转为深交所4位小数精度
+                order.Price = (price_raw // 100) * 100  # 向下取整到100的倍数
+            else:
+                # 上交所：3位小数精度，确保是整数
+                order.Price = int(bid_level['price'] * 1000)
+            
+            # 修复数量精度
+            if ob.SecurityIDSource == SecurityIDSource_SZSE:
+                order.OrderQty = int(bid_level['volume'] * 100)  # 深交所2位小数
+            else:
+                order.OrderQty = int(bid_level['volume'] * 1000)  # 上交所3位小数
+            
+            # 修复委托类型设置 - 关键修复
+            if ob.SecurityIDSource == SecurityIDSource_SZSE:
+                # 深交所
+                order.Side = ord('1')  # 买入
+                order.OrdType = ord('2')  # 限价
+            else:
+                # 上交所
+                order.Side = ord('B')  # 买入
+                order.OrdType = ord('A')  # 新增
+            
+            order.TransactTime = timestamp
             
             ob.onMsg(order)
             seq_num += 1
-            
+        
         # 模拟卖单
         for i, ask_level in enumerate(snapshot['ask_levels']):
             order = axsbe_order(ob.SecurityIDSource)
             order.SecurityID = ob.SecurityID
             order.ApplSeqNum = seq_num
-            order.Price = int(ask_level['price'] * 100)
-            order.OrderQty = int(ask_level['volume'])
-            order.setSide("卖出")
-            order.setType("限价")
-            order.TransactTime = int(current_time.strftime('%Y%m%d%H%M%S%f')[:-3])
-            #order.TradingPhaseMarket = ob.TradingPhaseMarket
+            
+            # 修复价格和数量精度（同上）
+            if ob.SecurityIDSource == SecurityIDSource_SZSE:
+                price_raw = int(ask_level['price'] * 10000)
+                order.Price = (price_raw // 100) * 100
+                order.OrderQty = int(ask_level['volume'] * 100)
+            else:
+                order.Price = int(ask_level['price'] * 1000)
+                order.OrderQty = int(ask_level['volume'] * 1000)
+            
+            # 修复委托类型设置
+            if ob.SecurityIDSource == SecurityIDSource_SZSE:
+                # 深交所
+                order.Side = ord('2')  # 卖出
+                order.OrdType = ord('2')  # 限价
+            else:
+                # 上交所
+                order.Side = ord('S')  # 卖出
+                order.OrdType = ord('A')  # 新增
+            
+            order.TransactTime = timestamp
             
             ob.onMsg(order)
             seq_num += 1
     
     def compare_orderbook_with_market(self, ob: AXOB, market_snapshot: Dict) -> Dict:
-        """比较订单簿与市场数据"""
+        """比较订单簿与市场数据（完整修复版）"""
         # 生成订单簿快照
         ob_snapshot = ob.genSnap()
         
@@ -319,9 +407,16 @@ class OrderBookAccuracyTest:
         
         # 比较买盘
         for i, market_bid in enumerate(market_snapshot['bid_levels'][:5]):
-            if i < len(ob_snapshot.bid):
-                ob_price = ob_snapshot.bid[i].Price / 1000000  # 转换精度
-                ob_volume = ob_snapshot.bid[i].Qty / 100
+            if i < len(ob_snapshot.bid) and ob_snapshot.bid[i].Qty > 0:
+                # 根据交易所类型正确转换精度
+                if ob.SecurityIDSource == SecurityIDSource_SZSE:
+                    # 深交所：快照价格6位小数精度，数量2位小数
+                    ob_price = ob_snapshot.bid[i].Price / 1000000
+                    ob_volume = ob_snapshot.bid[i].Qty / 100
+                else:
+                    # 上交所：快照价格3位小数精度，数量3位小数
+                    ob_price = ob_snapshot.bid[i].Price / 1000
+                    ob_volume = ob_snapshot.bid[i].Qty / 1000
                 
                 price_diff = abs(ob_price - market_bid['price'])
                 volume_diff = abs(ob_volume - market_bid['volume'])
@@ -344,12 +439,36 @@ class OrderBookAccuracyTest:
                     comparison['errors'].append(f"买{i+1}价格不匹配")
                 if not comparison['volume_match'][f'bid{i+1}']['match']:
                     comparison['errors'].append(f"买{i+1}数量不匹配")
+            else:
+                # 订单簿中没有对应档位或数量为0
+                comparison['price_match'][f'bid{i+1}'] = {
+                    'market': market_bid['price'],
+                    'orderbook': 0.0,
+                    'diff': market_bid['price'],
+                    'match': False
+                }
+                
+                comparison['volume_match'][f'bid{i+1}'] = {
+                    'market': market_bid['volume'],
+                    'orderbook': 0,
+                    'diff': market_bid['volume'],
+                    'match': False
+                }
+                
+                comparison['errors'].append(f"买{i+1}档位缺失")
         
         # 比较卖盘
         for i, market_ask in enumerate(market_snapshot['ask_levels'][:5]):
-            if i < len(ob_snapshot.ask):
-                ob_price = ob_snapshot.ask[i].Price / 1000000
-                ob_volume = ob_snapshot.ask[i].Qty / 100
+            if i < len(ob_snapshot.ask) and ob_snapshot.ask[i].Qty > 0:
+                # 根据交易所类型正确转换精度
+                if ob.SecurityIDSource == SecurityIDSource_SZSE:
+                    # 深交所：快照价格6位小数精度，数量2位小数
+                    ob_price = ob_snapshot.ask[i].Price / 1000000
+                    ob_volume = ob_snapshot.ask[i].Qty / 100
+                else:
+                    # 上交所：快照价格3位小数精度，数量3位小数
+                    ob_price = ob_snapshot.ask[i].Price / 1000
+                    ob_volume = ob_snapshot.ask[i].Qty / 1000
                 
                 price_diff = abs(ob_price - market_ask['price'])
                 volume_diff = abs(ob_volume - market_ask['volume'])
@@ -372,8 +491,35 @@ class OrderBookAccuracyTest:
                     comparison['errors'].append(f"卖{i+1}价格不匹配")
                 if not comparison['volume_match'][f'ask{i+1}']['match']:
                     comparison['errors'].append(f"卖{i+1}数量不匹配")
+            else:
+                # 订单簿中没有对应档位或数量为0
+                comparison['price_match'][f'ask{i+1}'] = {
+                    'market': market_ask['price'],
+                    'orderbook': 0.0,
+                    'diff': market_ask['price'],
+                    'match': False
+                }
+                
+                comparison['volume_match'][f'ask{i+1}'] = {
+                    'market': market_ask['volume'],
+                    'orderbook': 0,
+                    'diff': market_ask['volume'],
+                    'match': False
+                }
+                
+                comparison['errors'].append(f"卖{i+1}档位缺失")
         
+        # 计算总体成功率
         comparison['success'] = len(comparison['errors']) == 0
+        
+        # 添加统计信息
+        total_levels = len(market_snapshot['bid_levels']) + len(market_snapshot['ask_levels'])
+        matched_levels = sum(1 for key, value in comparison['price_match'].items() if value['match'])
+        matched_levels += sum(1 for key, value in comparison['volume_match'].items() if value['match'])
+        
+        comparison['match_rate'] = matched_levels / (total_levels * 2) if total_levels > 0 else 0
+        comparison['total_errors'] = len(comparison['errors'])
+        
         return comparison
     
     def test_single_stock(self, symbol: str) -> Dict:
