@@ -497,6 +497,15 @@ class AXOB():
             self.WARN = self.logger.warning
             self.ERR = self.logger.error
 
+            self.bid_levels = {} 
+            self.ask_levels = {} 
+            
+            # 缓存排序后的价格列表
+            self._bid_sorted_prices = []
+            self._ask_sorted_prices = []
+            self._bid_needs_sort = False
+            self._ask_needs_sort = False
+
     def onMsg(self, msg):
         '''处理总入口'''
         if isinstance(msg, (axsbe_order, axsbe_exe, axsbe_snap_stock)):
@@ -836,52 +845,50 @@ class AXOB():
 
                     self.genSnap()   #再出一个snap
 
-    def insertOrder(self, order: ob_order, outOfCage=False):
-        """订单入列，更新对应的价格档位数据"""
-        self.order_map[order.applSeqNum] = order
-        
-        side_tree = self.bid_level_tree if order.side == SIDE.BID else self.ask_level_tree
-        
-        # 更新价格档位
-        if order.price in side_tree:
-            level = side_tree[order.price]
-            level.qty += order.qty
-            
-            # 更新缓存的最优价格
-            if order.side == SIDE.BID and order.price == self.bid_max_level_price:
+    def _insert_bid_order(self, order, outOfCage):
+        """插入买单"""
+        if order.price in self.bid_levels:
+            self.bid_levels[order.price].qty += order.qty
+            if order.price == self.bid_max_level_price:
                 self.bid_max_level_qty += order.qty
-            elif order.side == SIDE.ASK and order.price == self.ask_min_level_price:
+        else:
+            self.bid_levels[order.price] = level_node(order.price, order.qty, order.applSeqNum)
+            self._bid_needs_sort = True
+            
+            if not outOfCage and (not self.bid_max_level_qty or order.price > self.bid_max_level_price):
+                self.bid_max_level_price = order.price
+                self.bid_max_level_qty = order.qty
+        
+        if not outOfCage:
+            self.BidWeightSize += order.qty
+            self.BidWeightValue += order.price * order.qty
+
+    def _insert_ask_order(self, order, outOfCage):
+        """插入卖单"""
+        if order.price in self.ask_levels:
+            self.ask_levels[order.price].qty += order.qty
+            if order.price == self.ask_min_level_price:
                 self.ask_min_level_qty += order.qty
         else:
-            # 创建新价格档位
-            node = level_node(order.price, order.qty, order.applSeqNum)
-            side_tree[order.price] = node
+            self.ask_levels[order.price] = level_node(order.price, order.qty, order.applSeqNum)
+            self._ask_needs_sort = True
             
-            # 更新最优价格
-            if not outOfCage:
-                if order.side == SIDE.BID:
-                    if self.bid_max_level_qty == 0 or order.price > self.bid_max_level_price:
-                        self.bid_max_level_price = order.price
-                        self.bid_max_level_qty = order.qty
-                        self.ask_cage_ref_px = order.price
-                else:  # ASK
-                    if self.ask_min_level_qty == 0 or order.price < self.ask_min_level_price:
-                        self.ask_min_level_price = order.price
-                        self.ask_min_level_qty = order.qty
-                        self.bid_cage_ref_px = order.price
+            if not outOfCage and (not self.ask_min_level_qty or order.price < self.ask_min_level_price):
+                self.ask_min_level_price = order.price
+                self.ask_min_level_qty = order.qty
         
-        # 更新加权统计
         if not outOfCage:
-            if order.side == SIDE.BID:
-                self.BidWeightSize += order.qty
-                self.BidWeightValue += order.price * order.qty
-            else:
-                if self.TradingPhaseMarket == TPM.OpenCall and order.price > self.PrevClosePx * CYB_ORDER_ENVALUE_MAX_RATE:
-                    self.AskWeightSizeEx += order.qty
-                    self.AskWeightValueEx += order.price * order.qty
-                else:
-                    self.AskWeightSize += order.qty
-                    self.AskWeightValue += order.price * order.qty
+            self.AskWeightSize += order.qty
+            self.AskWeightValue += order.price * order.qty
+    
+    def insertOrder(self, order: ob_order, outOfCage=False):
+        """优化的订单插入"""
+        self.order_map[order.applSeqNum] = order
+        
+        if order.side == SIDE.BID:
+            self._insert_bid_order(order, outOfCage)
+        else:
+            self._insert_ask_order(order, outOfCage)
 
     def onExec(self, exec:axsbe_exe):
         '''
@@ -1146,37 +1153,65 @@ class AXOB():
             self.ask_min_level_price = 0
             self.ask_min_level_qty = 0
 
-    def levelDequeue(self, side, price, qty, applSeqNum):
-        """买/卖方价格档出列（撤单或成交时）"""
-        side_tree = self.bid_level_tree if side == SIDE.BID else self.ask_level_tree
+    def _update_bid_max(self):
+        """更新买方最高价 - 使用缓存"""
+        if self._bid_needs_sort:
+            self._bid_sorted_prices = sorted(self.bid_levels.keys(), reverse=True)
+            self._bid_needs_sort = False
         
-        if price not in side_tree:
+        if self._bid_sorted_prices:
+            self.bid_max_level_price = self._bid_sorted_prices[0]
+            self.bid_max_level_qty = self.bid_levels[self.bid_max_level_price].qty
+        else:
+            self.bid_max_level_price = 0
+            self.bid_max_level_qty = 0
+
+    def _update_ask_min(self):
+        """更新卖方最低价 - 使用缓存"""
+        if self._ask_needs_sort:
+            self._ask_sorted_prices = sorted(self.ask_levels.keys())
+            self._ask_needs_sort = False
+        
+        if self._ask_sorted_prices:
+            self.ask_min_level_price = self._ask_sorted_prices[0]
+            self.ask_min_level_qty = self.ask_levels[self.ask_min_level_price].qty
+        else:
+            self.ask_min_level_price = 0
+            self.ask_min_level_qty = 0
+
+    def levelDequeue(self, side, price, qty, applSeqNum):
+        """优化的价格档位出列"""
+        levels = self.bid_levels if side == SIDE.BID else self.ask_levels
+        
+        if price not in levels:
             return
-            
-        level = side_tree[price]
+        
+        level = levels[price]
         level.qty -= qty
         
-        # 更新缓存和统计
+        # 更新统计
         if side == SIDE.BID:
-            if price == self.bid_max_level_price:
-                self.bid_max_level_qty -= qty
             self.BidWeightSize -= qty
             self.BidWeightValue -= price * qty
+            if price == self.bid_max_level_price:
+                self.bid_max_level_qty -= qty
         else:
-            if price == self.ask_min_level_price:
-                self.ask_min_level_qty -= qty
             self.AskWeightSize -= qty
             self.AskWeightValue -= price * qty
+            if price == self.ask_min_level_price:
+                self.ask_min_level_qty -= qty
         
-        # 删除空价格档位
-        if level.qty == 0:
-            del side_tree[price]
-            
-            # 更新最优价格
-            if side == SIDE.BID and price == self.bid_max_level_price:
-                self._updateBidMax()
-            elif side == SIDE.ASK and price == self.ask_min_level_price:
-                self._updateAskMin()
+        # 删除空档位
+        if level.qty <= 0:
+            del levels[price]
+            if side == SIDE.BID:
+                self._bid_needs_sort = True
+                if price == self.bid_max_level_price:
+                    self._update_bid_max()
+            else:
+                self._ask_needs_sort = True
+                if price == self.ask_min_level_price:
+                    self._update_ask_min()
 
 
     def onSnap(self, snap:axsbe_snap_stock):
@@ -1404,96 +1439,85 @@ class AXOB():
             else:
                 snap.TransactTime = self.current_inc_tick // 100 #上交所只显示到秒，去掉10ms和100ms两位
 
-
+    def _calculate_auction_match(self, bid_prices, ask_prices):
+        """计算集合竞价撮合结果"""
+        bid_idx = ask_idx = 0
+        bid_cum = ask_cum = 0
+        volume = 0
+        price = 0
+        
+        while bid_idx < len(bid_prices) and ask_idx < len(ask_prices):
+            bp = bid_prices[bid_idx]
+            ap = ask_prices[ask_idx]
+            
+            if bp < ap:
+                break
+            
+            # 累计数量
+            if bid_cum == 0:
+                bid_cum = self.bid_level_tree[bp].qty
+            if ask_cum == 0:
+                ask_cum = self.ask_level_tree[ap].qty
+            
+            # 处理撮合
+            if bid_cum < ask_cum:
+                volume += bid_cum
+                price = bp
+                bid_idx += 1
+                bid_cum = 0
+            elif bid_cum > ask_cum:
+                volume += ask_cum
+                price = ap
+                ask_idx += 1
+                ask_cum = 0
+            else:
+                volume += bid_cum
+                # 使用参考价
+                ref = self.PrevClosePx if self.NumTrades == 0 else self.LastPx
+                if bp >= ref >= ap:
+                    price = ref
+                else:
+                    price = bp if abs(bp - ref) < abs(ap - ref) else ap
+                bid_idx += 1
+                ask_idx += 1
+                bid_cum = ask_cum = 0
+        
+        return price, volume, bid_cum, ask_cum
 
     def genCallSnap(self, show_level_nb=10, show_potential=False):
-        """生成集合竞价快照"""
-        # 获取双方最优价格
-        bid_levels = sorted(self.bid_level_tree.items(), reverse=True)
-        ask_levels = sorted(self.ask_level_tree.items())
+        """生成集合竞价快照 - 优化版本"""
+        # 使用列表而不是sorted()，避免重复排序
+        bid_prices = list(self.bid_level_tree.keys())
+        ask_prices = list(self.ask_level_tree.keys())
         
-        # 计算撮合价格和成交量
-        price = 0
-        volumeTrade = 0
-        bid_cum_qty = 0
-        ask_cum_qty = 0
+        if not bid_prices or not ask_prices:
+            # 快速处理空订单簿情况
+            snap = self._create_empty_snap(show_level_nb)
+            return snap
         
-        bid_idx, ask_idx = 0, 0
+        # 只排序一次
+        bid_prices.sort(reverse=True)
+        ask_prices.sort()
         
-        while bid_idx < len(bid_levels) and ask_idx < len(ask_levels):
-            bid_price, bid_level = bid_levels[bid_idx]
-            ask_price, ask_level = ask_levels[ask_idx]
-            
-            if bid_price < ask_price:
-                break
-                
-            # 可以撮合
-            bid_cum_qty += bid_level.qty if bid_cum_qty == 0 else bid_level.qty
-            ask_cum_qty += ask_level.qty if ask_cum_qty == 0 else ask_level.qty
-            
-            if bid_cum_qty < ask_cum_qty:
-                volumeTrade += bid_cum_qty
-                price = bid_price
-                bid_idx += 1
-                bid_cum_qty = 0
-            elif bid_cum_qty > ask_cum_qty:
-                volumeTrade += ask_cum_qty
-                price = ask_price
-                ask_idx += 1
-                ask_cum_qty = 0
-            else:  # 相等
-                volumeTrade += bid_cum_qty
-                # 根据参考价确定成交价
-                ref_px = self.PrevClosePx if self.NumTrades == 0 else self.LastPx
-                if bid_price >= ref_px >= ask_price:
-                    price = ref_px
-                else:
-                    price = bid_price if abs(bid_price - ref_px) < abs(ask_price - ref_px) else ask_price
-                bid_idx += 1
-                ask_idx += 1
-                bid_cum_qty = ask_cum_qty = 0
+        # 快速计算撮合结果
+        price, volume, bid_remain, ask_remain = self._calculate_auction_match(
+            bid_prices, ask_prices
+        )
         
-        # 构造快照
+        # 创建快照
         snap = axsbe_snap_stock(SecurityIDSource=self.SecurityIDSource, source="AXOB-call")
         self._setSnapFixParam(snap)
         
         # 设置价格档位
-        snap_ask_levels = {}
-        snap_bid_levels = {}
-        
-        if volumeTrade == 0:
-            # 无法撮合
-            if show_potential:
-                snap_ask_levels, snap_bid_levels = self._getLevels(show_level_nb)
-            else:
-                for i in range(show_level_nb):
-                    snap_ask_levels[i] = price_level(0, 0)
-                    snap_bid_levels[i] = price_level(0, 0)
+        if volume == 0:
+            snap.ask, snap.bid = self._create_empty_levels(show_level_nb, show_potential)
         else:
-            # 可撮合
-            snap_ask_levels[0] = price_level(self._fmtPrice_inter2snap(price), volumeTrade)
-            snap_ask_levels[1] = price_level(0, ask_cum_qty)
-            snap_bid_levels[0] = price_level(self._fmtPrice_inter2snap(price), volumeTrade)
-            snap_bid_levels[1] = price_level(0, bid_cum_qty)
-            
-            for i in range(2, show_level_nb):
-                snap_ask_levels[i] = price_level(0, 0)
-                snap_bid_levels[i] = price_level(0, 0)
+            snap.ask, snap.bid = self._create_matched_levels(
+                price, volume, bid_remain, ask_remain, show_level_nb
+            )
         
-        snap.ask = snap_ask_levels
-        snap.bid = snap_bid_levels
-        
-        # 设置其他字段
-        snap.NumTrades = self.NumTrades
-        snap.TotalVolumeTrade = self.TotalVolumeTrade
-        snap.TotalValueTrade = self.TotalValueTrade
-        snap.LastPx = self._fmtPrice_inter2snap(self.LastPx)
-        snap.HighPx = self._fmtPrice_inter2snap(self.HighPx)
-        snap.LowPx = self._fmtPrice_inter2snap(self.LowPx)
-        snap.OpenPx = self._fmtPrice_inter2snap(self.OpenPx)
-        
-        self._setSnapTimestamp(snap)
-        snap.update_TradingPhaseCode(self.TradingPhaseMarket, TPI.Normal)
+        # 批量设置其他字段
+        self._set_snap_fields(snap)
         
         return snap
         
