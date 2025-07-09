@@ -506,56 +506,66 @@ class AXOB():
             self._bid_needs_sort = False
             self._ask_needs_sort = False
 
+    def _handle_order_msg(self, msg):
+        """处理订单消息"""
+        if not self._check_sequence(msg):
+            return
+        
+        assert self.constantValue_ready, f'{self.SecurityID:06d} constant values not ready!'
+        self._useTimestamp(msg.TransactTime)
+        
+        if self.TradingPhaseMarket != axsbe_base.TPM.VolatilityBreaking:
+            self.TradingPhaseMarket = msg.TradingPhaseMarket
+        
+        self.onOrder(msg)
+        
+        if self.SecurityIDSource == SecurityIDSource_SZSE:
+            self.last_inc_applSeqNum = msg.ApplSeqNum
+
+    def _check_sequence(self, msg):
+        """检查序列号"""
+        if self.SecurityIDSource == SecurityIDSource_SZSE and msg.ApplSeqNum <= self.last_inc_applSeqNum:
+            self.ERR(f"ApplSeqNum={msg.ApplSeqNum} <= last_inc_applSeqNum={self.last_inc_applSeqNum}")
+            return False
+        return True
+
+    def _handle_exe_msg(self, msg):
+        """处理成交消息"""
+        if not self._check_sequence(msg):
+            return
+        
+        assert self.constantValue_ready, f'{self.SecurityID:06d} constant values not ready!'
+        self._useTimestamp(msg.TransactTime)
+        
+        if self.TradingPhaseMarket != axsbe_base.TPM.VolatilityBreaking:
+            self.TradingPhaseMarket = msg.TradingPhaseMarket
+        
+        self.onExec(msg)
+        
+        if self.SecurityIDSource == SecurityIDSource_SZSE:
+            self.last_inc_applSeqNum = msg.ApplSeqNum
+
     def onMsg(self, msg):
         """优化的消息处理 - 减少重复判断"""
-        # 使用 getattr 避免多次属性访问
-        msg_type = type(msg)
+        # 使用消息类型映射表
+        msg_handlers = {
+            axsbe_order: self._handle_order_msg,
+            axsbe_exe: self._handle_exe_msg,
+            axsbe_snap_stock: self.onSnap,
+            AX_SIGNAL: self._handleSignal
+        }
         
-        # 快速过滤
-        if msg_type not in (axsbe_order, axsbe_exe, axsbe_snap_stock, AX_SIGNAL):
+        handler = msg_handlers.get(type(msg))
+        if not handler:
             return
         
-        if msg_type != AX_SIGNAL and msg.SecurityID != self.SecurityID:
+        # 非信号消息需要检查 SecurityID
+        if type(msg) != AX_SIGNAL and getattr(msg, 'SecurityID', None) != self.SecurityID:
             return
         
-        # 处理逐笔消息
-        if msg_type in (axsbe_order, axsbe_exe):
-            # 序列号检查（仅深交所）
-            if self.SecurityIDSource == SecurityIDSource_SZSE and msg.ApplSeqNum <= self.last_inc_applSeqNum:
-                self.ERR(f"ApplSeqNum={msg.ApplSeqNum} <= last_inc_applSeqNum={self.last_inc_applSeqNum}")
-                return
-            
-            assert self.constantValue_ready, f'{self.SecurityID:06d} constant values not ready!'
-            
-            self._useTimestamp(msg.TransactTime)
-            
-            # 更新交易阶段
-            if self.TradingPhaseMarket != axsbe_base.TPM.VolatilityBreaking:
-                self.TradingPhaseMarket = msg.TradingPhaseMarket
-            
-            # 处理消息
-            if msg_type == axsbe_order:
-                self.onOrder(msg)
-            else:
-                self.onExec(msg)
-            
-            # 更新序列号（仅深交所）
-            if self.SecurityIDSource == SecurityIDSource_SZSE:
-                self.last_inc_applSeqNum = msg.ApplSeqNum
-        
-        elif msg_type == axsbe_snap_stock:
-            self.onSnap(msg)
-        
-        elif msg_type == AX_SIGNAL:
-            self._handleSignal(msg)
-        
-        # 更新统计
+        handler(msg)
         self.msg_nb += 1
         self.profile()
-        
-        # 验证（仅调试模式）
-        if __debug__:
-            self._validate()
 
 
     def openCage(self):
@@ -780,43 +790,51 @@ class AXOB():
         if not outOfCage:
             self.AskWeightSize += order.qty
             self.AskWeightValue += order.price * order.qty
+
+    def _insert_bid_level(self, order, outOfCage):
+        """插入买单到价格档位"""
+        level_tree = self.bid_level_tree
+        
+        if order.price in level_tree:
+            level_tree[order.price].qty += order.qty
+            if order.price == self.bid_max_level_price:
+                self.bid_max_level_qty += order.qty
+        else:
+            level_tree[order.price] = level_node(order.price, order.qty, order.applSeqNum)
+            if not outOfCage and (not self.bid_max_level_qty or order.price > self.bid_max_level_price):
+                self.bid_max_level_price = order.price
+                self.bid_max_level_qty = order.qty
+        
+        if not outOfCage:
+            self.BidWeightSize += order.qty
+            self.BidWeightValue += order.price * order.qty
+
+    def _insert_ask_level(self, order, outOfCage):
+        """插入卖单到价格档位"""
+        level_tree = self.ask_level_tree
+        
+        if order.price in level_tree:
+            level_tree[order.price].qty += order.qty
+            if order.price == self.ask_min_level_price:
+                self.ask_min_level_qty += order.qty
+        else:
+            level_tree[order.price] = level_node(order.price, order.qty, order.applSeqNum)
+            if not outOfCage and (not self.ask_min_level_qty or order.price < self.ask_min_level_price):
+                self.ask_min_level_price = order.price
+                self.ask_min_level_qty = order.qty
+        
+        if not outOfCage:
+            self.AskWeightSize += order.qty
+            self.AskWeightValue += order.price * order.qty
     
     def insertOrder(self, order: ob_order, outOfCage=False):
-        """优化的订单插入 - 减少重复操作"""
+        """优化的订单插入 - 使用统一的辅助函数"""
         self.order_map[order.applSeqNum] = order
         
         if order.side == SIDE.BID:
-            # 买单处理
-            level_tree = self.bid_level_tree
-            if order.price in level_tree:
-                level_tree[order.price].qty += order.qty
-                if order.price == self.bid_max_level_price:
-                    self.bid_max_level_qty += order.qty
-            else:
-                level_tree[order.price] = level_node(order.price, order.qty, order.applSeqNum)
-                if not outOfCage and (not self.bid_max_level_qty or order.price > self.bid_max_level_price):
-                    self.bid_max_level_price = order.price
-                    self.bid_max_level_qty = order.qty
-            
-            if not outOfCage:
-                self.BidWeightSize += order.qty
-                self.BidWeightValue += order.price * order.qty
+            self._insert_bid_level(order, outOfCage)
         else:
-            # 卖单处理
-            level_tree = self.ask_level_tree
-            if order.price in level_tree:
-                level_tree[order.price].qty += order.qty
-                if order.price == self.ask_min_level_price:
-                    self.ask_min_level_qty += order.qty
-            else:
-                level_tree[order.price] = level_node(order.price, order.qty, order.applSeqNum)
-                if not outOfCage and (not self.ask_min_level_qty or order.price < self.ask_min_level_price):
-                    self.ask_min_level_price = order.price
-                    self.ask_min_level_qty = order.qty
-            
-            if not outOfCage:
-                self.AskWeightSize += order.qty
-                self.AskWeightValue += order.price * order.qty
+            self._insert_ask_level(order, outOfCage)
 
     def onExec(self, exec:axsbe_exe):
         '''
@@ -947,76 +965,103 @@ class AXOB():
 
     def enterCage(self):
         """优化的价格笼子进入逻辑"""
-        while True:
-            bid_entered = ask_entered = False
-            
-            # 检查买方隐藏订单
-            if self.bid_cage_upper_ex_min_level_qty and \
-            self.bid_cage_upper_ex_min_level_price <= CYB_cage_upper(self.bid_cage_ref_px):
-                
-                if self.ask_min_level_qty and \
-                self.bid_cage_upper_ex_min_level_price >= self.ask_min_level_price and \
-                self.TradingPhaseMarket != axsbe_base.TPM.VolatilityBreaking:
-                    # 可成交，等待
-                    self.bid_waiting_for_cage = True
-                    break
-                
-                # 进入笼子
-                self.bid_max_level_price = self.bid_cage_upper_ex_min_level_price
-                self.bid_max_level_qty = self.bid_cage_upper_ex_min_level_qty
-                self.BidWeightSize += self.bid_cage_upper_ex_min_level_qty
-                self.BidWeightValue += self.bid_cage_upper_ex_min_level_price * self.bid_cage_upper_ex_min_level_qty
-                
-                # 更新参考价格
-                self.ask_cage_ref_px = self.bid_max_level_price
-                if not self.ask_min_level_qty:
-                    self.bid_cage_ref_px = self.bid_max_level_price
-                
-                # 查找下一个隐藏订单
-                self.bid_cage_upper_ex_min_level_qty = 0
-                for p in sorted(p for p in self.bid_level_tree.keys() if p > self.bid_cage_upper_ex_min_level_price):
-                    self.bid_cage_upper_ex_min_level_price = p
-                    self.bid_cage_upper_ex_min_level_qty = self.bid_level_tree[p].qty
-                    break
-                
-                bid_entered = True
-            
-            # 检查卖方隐藏订单（类似逻辑）
-            if self.ask_cage_lower_ex_max_level_qty and \
-            self.ask_cage_lower_ex_max_level_price >= CYB_cage_lower(self.ask_cage_ref_px):
-                
-                if self.bid_max_level_qty and \
-                self.ask_cage_lower_ex_max_level_price <= self.bid_max_level_price and \
-                self.TradingPhaseMarket != axsbe_base.TPM.VolatilityBreaking:
-                    # 可成交，等待
-                    self.ask_waiting_for_cage = True
-                    break
-                
-                # 进入笼子
-                self.ask_min_level_price = self.ask_cage_lower_ex_max_level_price
-                self.ask_min_level_qty = self.ask_cage_lower_ex_max_level_qty
-                self.AskWeightSize += self.ask_cage_lower_ex_max_level_qty
-                self.AskWeightValue += self.ask_cage_lower_ex_max_level_price * self.ask_cage_lower_ex_max_level_qty
-                
-                # 更新参考价格
-                self.bid_cage_ref_px = self.ask_min_level_price
-                if not self.bid_max_level_qty:
-                    self.ask_cage_ref_px = self.ask_min_level_price
-                
-                # 查找下一个隐藏订单
-                self.ask_cage_lower_ex_max_level_qty = 0
-                for p in sorted((p for p in self.ask_level_tree.keys() if p < self.ask_cage_lower_ex_max_level_price), reverse=True):
-                    self.ask_cage_lower_ex_max_level_price = p
-                    self.ask_cage_lower_ex_max_level_qty = self.ask_level_tree[p].qty
-                    break
-                
-                ask_entered = True
-            
-            # 如果没有订单进入笼子，退出循环
-            if not bid_entered and not ask_entered:
-                self.bid_waiting_for_cage = False
-                self.ask_waiting_for_cage = False
-                break
+        while self._process_cage_orders():
+            pass
+        
+        self.bid_waiting_for_cage = False
+        self.ask_waiting_for_cage = False
+
+    def _process_cage_orders(self):
+        """处理价格笼子订单，返回是否有订单进入"""
+        bid_entered = self._process_bid_cage_orders()
+        ask_entered = self._process_ask_cage_orders()
+        return bid_entered or ask_entered
+
+    def _process_bid_cage_orders(self):
+        """处理买方价格笼子订单"""
+        if not self.bid_cage_upper_ex_min_level_qty:
+            return False
+        
+        if self.bid_cage_upper_ex_min_level_price > CYB_cage_upper(self.bid_cage_ref_px):
+            return False
+        
+        # 检查是否可成交
+        if (self.ask_min_level_qty and 
+            self.bid_cage_upper_ex_min_level_price >= self.ask_min_level_price and
+            self.TradingPhaseMarket != axsbe_base.TPM.VolatilityBreaking):
+            self.bid_waiting_for_cage = True
+            return False
+        
+        # 进入笼子
+        self._enter_bid_cage()
+        return True
+
+    def _process_ask_cage_orders(self):
+        """处理卖方价格笼子订单"""
+        if not self.ask_cage_lower_ex_max_level_qty:
+            return False
+        
+        if self.ask_cage_lower_ex_max_level_price < CYB_cage_lower(self.ask_cage_ref_px):
+            return False
+        
+        # 检查是否可成交
+        if (self.bid_max_level_qty and
+            self.ask_cage_lower_ex_max_level_price <= self.bid_max_level_price and
+            self.TradingPhaseMarket != axsbe_base.TPM.VolatilityBreaking):
+            self.ask_waiting_for_cage = True
+            return False
+        
+        # 进入笼子
+        self._enter_ask_cage()
+        return True
+
+    def _enter_bid_cage(self):
+        """买方订单进入笼子"""
+        self.bid_max_level_price = self.bid_cage_upper_ex_min_level_price
+        self.bid_max_level_qty = self.bid_cage_upper_ex_min_level_qty
+        self.BidWeightSize += self.bid_cage_upper_ex_min_level_qty
+        self.BidWeightValue += self.bid_cage_upper_ex_min_level_price * self.bid_cage_upper_ex_min_level_qty
+        
+        # 更新参考价格
+        self.ask_cage_ref_px = self.bid_max_level_price
+        if not self.ask_min_level_qty:
+            self.bid_cage_ref_px = self.bid_max_level_price
+        
+        # 查找下一个隐藏订单
+        self._update_next_bid_cage_order()
+
+    def _enter_ask_cage(self):
+        """卖方订单进入笼子"""
+        self.ask_min_level_price = self.ask_cage_lower_ex_max_level_price
+        self.ask_min_level_qty = self.ask_cage_lower_ex_max_level_qty
+        self.AskWeightSize += self.ask_cage_lower_ex_max_level_qty
+        self.AskWeightValue += self.ask_cage_lower_ex_max_level_price * self.ask_cage_lower_ex_max_level_qty
+        
+        # 更新参考价格
+        self.bid_cage_ref_px = self.ask_min_level_price
+        if not self.bid_max_level_qty:
+            self.ask_cage_ref_px = self.ask_min_level_price
+        
+        # 查找下一个隐藏订单
+        self._update_next_ask_cage_order()
+
+    def _update_next_bid_cage_order(self):
+        """更新下一个买方隐藏订单"""
+        self.bid_cage_upper_ex_min_level_qty = 0
+        for price in sorted(p for p in self.bid_level_tree.keys() 
+                        if p > self.bid_cage_upper_ex_min_level_price):
+            self.bid_cage_upper_ex_min_level_price = price
+            self.bid_cage_upper_ex_min_level_qty = self.bid_level_tree[price].qty
+            break
+
+    def _update_next_ask_cage_order(self):
+        """更新下一个卖方隐藏订单"""
+        self.ask_cage_lower_ex_max_level_qty = 0
+        for price in sorted((p for p in self.ask_level_tree.keys() 
+                            if p < self.ask_cage_lower_ex_max_level_price), reverse=True):
+            self.ask_cage_lower_ex_max_level_price = price
+            self.ask_cage_lower_ex_max_level_qty = self.ask_level_tree[price].qty
+            break
 
 
     def tradeLimit(self, side:SIDE, Qty, appSeqNum):
@@ -1086,79 +1131,75 @@ class AXOB():
             self.ask_min_level_qty = 0
 
     def _update_bid_max(self):
-        """更新买方最高价 - 使用缓存"""
-        if self._bid_needs_sort:
-            self._bid_sorted_prices = sorted(self.bid_levels.keys(), reverse=True)
-            self._bid_needs_sort = False
-        
-        if self._bid_sorted_prices:
-            self.bid_max_level_price = self._bid_sorted_prices[0]
-            self.bid_max_level_qty = self.bid_levels[self.bid_max_level_price].qty
+        """更新买方最高价"""
+        if self.bid_level_tree:
+            self.bid_max_level_price = max(self.bid_level_tree.keys())
+            self.bid_max_level_qty = self.bid_level_tree[self.bid_max_level_price].qty
         else:
             self.bid_max_level_price = 0
             self.bid_max_level_qty = 0
 
     def _update_ask_min(self):
-        """更新卖方最低价 - 使用缓存"""
-        if self._ask_needs_sort:
-            self._ask_sorted_prices = sorted(self.ask_levels.keys())
-            self._ask_needs_sort = False
-        
-        if self._ask_sorted_prices:
-            self.ask_min_level_price = self._ask_sorted_prices[0]
-            self.ask_min_level_qty = self.ask_levels[self.ask_min_level_price].qty
+        """更新卖方最低价"""
+        if self.ask_level_tree:
+            self.ask_min_level_price = min(self.ask_level_tree.keys())
+            self.ask_min_level_qty = self.ask_level_tree[self.ask_min_level_price].qty
         else:
             self.ask_min_level_price = 0
             self.ask_min_level_qty = 0
 
-    def levelDequeue(self, side, price, qty, applSeqNum):
-        """优化的价格档位出列 - 减少查找和更新操作"""
-        level_tree = self.bid_level_tree if side == SIDE.BID else self.ask_level_tree
-        
+    def _dequeue_bid_level(self, price, qty):
+        """买单出列"""
+        level_tree = self.bid_level_tree
         if price not in level_tree:
             return
         
         level = level_tree[price]
         level.qty -= qty
         
+        # 更新统计
+        if not (self.bid_cage_upper_ex_min_level_qty and price >= self.bid_cage_upper_ex_min_level_price):
+            self.BidWeightSize -= qty
+            self.BidWeightValue -= price * qty
+        
+        # 处理最高价变化
+        if price == self.bid_max_level_price:
+            self.bid_max_level_qty -= qty
+            if level.qty <= 0:
+                del level_tree[price]
+                self._update_bid_max()
+        elif level.qty <= 0:
+            del level_tree[price]
+
+    def _dequeue_ask_level(self, price, qty):
+        """卖单出列"""
+        level_tree = self.ask_level_tree
+        if price not in level_tree:
+            return
+        
+        level = level_tree[price]
+        level.qty -= qty
+        
+        # 更新统计
+        if not (self.ask_cage_lower_ex_max_level_qty and price <= self.ask_cage_lower_ex_max_level_price):
+            self.AskWeightSize -= qty
+            self.AskWeightValue -= price * qty
+        
+        # 处理最低价变化
+        if price == self.ask_min_level_price:
+            self.ask_min_level_qty -= qty
+            if level.qty <= 0:
+                del level_tree[price]
+                self._update_ask_min()
+        elif level.qty <= 0:
+            del level_tree[price]
+
+    def levelDequeue(self, side, price, qty, applSeqNum):
+        """优化的价格档位出列"""
         if side == SIDE.BID:
-            # 更新买方统计
-            if not (self.bid_cage_upper_ex_min_level_qty and price >= self.bid_cage_upper_ex_min_level_price):
-                self.BidWeightSize -= qty
-                self.BidWeightValue -= price * qty
-            
-            if price == self.bid_max_level_price:
-                self.bid_max_level_qty -= qty
-                if level.qty <= 0:
-                    # 需要找新的最高价
-                    del level_tree[price]
-                    if level_tree:
-                        self.bid_max_level_price = max(level_tree.keys())
-                        self.bid_max_level_qty = level_tree[self.bid_max_level_price].qty
-                    else:
-                        self.bid_max_level_price = 0
-                        self.bid_max_level_qty = 0
-            elif level.qty <= 0:
-                del level_tree[price]
+            self._dequeue_bid_level(price, qty)
         else:
-            # 更新卖方统计
-            if not (self.ask_cage_lower_ex_max_level_qty and price <= self.ask_cage_lower_ex_max_level_price):
-                self.AskWeightSize -= qty
-                self.AskWeightValue -= price * qty
-            
-            if price == self.ask_min_level_price:
-                self.ask_min_level_qty -= qty
-                if level.qty <= 0:
-                    # 需要找新的最低价
-                    del level_tree[price]
-                    if level_tree:
-                        self.ask_min_level_price = min(level_tree.keys())
-                        self.ask_min_level_qty = level_tree[self.ask_min_level_price].qty
-                    else:
-                        self.ask_min_level_price = 0
-                        self.ask_min_level_qty = 0
-            elif level.qty <= 0:
-                del level_tree[price]
+            self._dequeue_ask_level(price, qty)
 
 
     def onSnap(self, snap:axsbe_snap_stock):
@@ -1430,25 +1471,14 @@ class AXOB():
                 bid_cum = ask_cum = 0
         
         return price, volume, bid_cum, ask_cum
-
-    def genCallSnap(self, show_level_nb=10, show_potential=False):
-        """优化的集合竞价快照生成"""
-        # 快速处理空订单簿
-        if not self.bid_level_tree or not self.ask_level_tree:
-            snap = axsbe_snap_stock(SecurityIDSource=self.SecurityIDSource, source="AXOB-call")
-            self._setSnapFixParam(snap)
-            snap.ask = {i: price_level(0, 0) for i in range(show_level_nb)}
-            snap.bid = {i: price_level(0, 0) for i in range(show_level_nb)}
-            self._setSnapTimestamp(snap)
-            snap.update_TradingPhaseCode(self.TradingPhaseMarket, axsbe_base.TPI.Normal)
-            return snap
-        
-        # 使用列表缓存排序结果
+    
+    def _calculate_call_auction_match(self):
+        """计算集合竞价撮合结果"""
         bid_prices = sorted(self.bid_level_tree.keys(), reverse=True)
         ask_prices = sorted(self.ask_level_tree.keys())
         
-        # 快速计算撮合
-        price, volume = 0, 0
+        price = 0
+        volume = 0
         bid_idx = ask_idx = 0
         bid_cum = ask_cum = 0
         
@@ -1469,7 +1499,7 @@ class AXOB():
             trade_qty = min(bid_cum, ask_cum)
             volume += trade_qty
             
-            # 确定价格
+            # 更新价格和索引
             if bid_cum < ask_cum:
                 price = bp
                 bid_idx += 1
@@ -1483,63 +1513,41 @@ class AXOB():
             else:
                 # 相等时使用参考价
                 ref = self.PrevClosePx if self.NumTrades == 0 else self.LastPx
-                if bp >= ref >= ap:
-                    price = ref
-                else:
-                    price = bp if abs(bp - ref) < abs(ap - ref) else ap
+                price = self._get_match_price(bp, ap, ref)
                 bid_idx += 1
                 ask_idx += 1
                 bid_cum = ask_cum = 0
         
-        # 生成快照
-        snap = axsbe_snap_stock(SecurityIDSource=self.SecurityIDSource, source="AXOB-call")
-        self._setSnapFixParam(snap)
+        return {'price': price, 'volume': volume}
+    
+    def _get_match_price(self, bid_price, ask_price, ref_price):
+        """获取撮合价格"""
+        if bid_price >= ref_price >= ask_price:
+            return ref_price
+        return bid_price if abs(bid_price - ref_price) < abs(ask_price - ref_price) else ask_price
+    
+    def _generate_call_levels(self, level_tree, match_price, level_nb, ascending):
+        """生成集合竞价档位"""
+        levels = {}
+        prices = sorted(level_tree.keys(), reverse=not ascending)
         
-        # 填充价格档位
-        snap_ask_levels = {}
-        snap_bid_levels = {}
+        level_idx = 0
+        for i in range(level_nb):
+            if level_idx < len(prices):
+                price = prices[level_idx]
+                if (ascending and price > match_price) or (not ascending and price < match_price):
+                    levels[i] = price_level(self._fmtPrice_inter2snap(price), 
+                                        level_tree[price].qty)
+                    level_idx += 1
+                else:
+                    levels[i] = price_level(0, 0)
+            else:
+                levels[i] = price_level(0, 0)
         
-        if volume > 0:
-            # 有成交的情况
-            for i in range(show_level_nb):
-                if i < len(ask_prices) and ask_prices[i] > price:
-                    snap_ask_levels[i] = price_level(
-                        self._fmtPrice_inter2snap(ask_prices[i]),
-                        self.ask_level_tree[ask_prices[i]].qty
-                    )
-                else:
-                    snap_ask_levels[i] = price_level(0, 0)
-                
-                if i < len(bid_prices) and bid_prices[i] < price:
-                    snap_bid_levels[i] = price_level(
-                        self._fmtPrice_inter2snap(bid_prices[i]),
-                        self.bid_level_tree[bid_prices[i]].qty
-                    )
-                else:
-                    snap_bid_levels[i] = price_level(0, 0)
-        else:
-            # 无成交的情况
-            for i in range(show_level_nb):
-                if i < len(ask_prices):
-                    snap_ask_levels[i] = price_level(
-                        self._fmtPrice_inter2snap(ask_prices[i]),
-                        self.ask_level_tree[ask_prices[i]].qty
-                    )
-                else:
-                    snap_ask_levels[i] = price_level(0, 0)
-                
-                if i < len(bid_prices):
-                    snap_bid_levels[i] = price_level(
-                        self._fmtPrice_inter2snap(bid_prices[i]),
-                        self.bid_level_tree[bid_prices[i]].qty
-                    )
-                else:
-                    snap_bid_levels[i] = price_level(0, 0)
-        
-        snap.ask = snap_ask_levels
-        snap.bid = snap_bid_levels
-        
-        # 设置其他字段
+        return levels
+
+    def _finalize_snap(self, snap):
+        """完成快照设置"""
         snap.NumTrades = self.NumTrades
         snap.TotalVolumeTrade = self.TotalVolumeTrade
         snap.TotalValueTrade = self.TotalValueTrade
@@ -1550,7 +1558,29 @@ class AXOB():
         
         self._setSnapTimestamp(snap)
         snap.update_TradingPhaseCode(self.TradingPhaseMarket, axsbe_base.TPI.Normal)
+
+    def genCallSnap(self, show_level_nb=10, show_potential=False):
+        """优化的集合竞价快照生成"""
+        snap = axsbe_snap_stock(SecurityIDSource=self.SecurityIDSource, source="AXOB-call")
+        self._setSnapFixParam(snap)
         
+        # 空订单簿快速处理
+        if not self.bid_level_tree or not self.ask_level_tree:
+            snap.ask = {i: price_level(0, 0) for i in range(show_level_nb)}
+            snap.bid = {i: price_level(0, 0) for i in range(show_level_nb)}
+            self._finalize_snap(snap)
+            return snap
+        
+        # 计算撮合结果
+        match_result = self._calculate_call_auction_match()
+        
+        # 生成价格档位
+        snap.ask = self._generate_call_levels(self.ask_level_tree, match_result['price'], 
+                                            show_level_nb, ascending=True)
+        snap.bid = self._generate_call_levels(self.bid_level_tree, match_result['price'], 
+                                            show_level_nb, ascending=False)
+        
+        self._finalize_snap(snap)
         return snap
         
 
