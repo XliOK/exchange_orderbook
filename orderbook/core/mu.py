@@ -11,7 +11,7 @@ class MU:
     def __init__(self, SecurityID_list, SecurityIDSource, instrument_type):
         # 直接使用字典存储
         self.axobs = {sid: AXOB(sid, SecurityIDSource, instrument_type) 
-                     for sid in SecurityID_list}
+                    for sid in SecurityID_list}
         
         self.SecurityIDSource = SecurityIDSource
         self.channel_map = {}  # ChannelID -> {'TPM': ?, 'sids': set()}
@@ -23,6 +23,12 @@ class MU:
         self.logger.setLevel(g_logger.getEffectiveLevel())
         for h in g_logger.handlers:
             self.logger.addHandler(h)
+        
+        # 添加日志方法引用
+        self.DBG = self.logger.debug
+        self.INFO = self.logger.info
+        self.WARN = self.logger.warning
+        self.ERR = self.logger.error
     
     def _setup_logger(self, SecurityID_list):
         """设置日志"""

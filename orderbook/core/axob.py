@@ -497,15 +497,6 @@ class AXOB():
             self.WARN = self.logger.warning
             self.ERR = self.logger.error
 
-            self.bid_levels = {} 
-            self.ask_levels = {} 
-            
-            # 缓存排序后的价格列表
-            self._bid_sorted_prices = []
-            self._ask_sorted_prices = []
-            self._bid_needs_sort = False
-            self._ask_needs_sort = False
-
     def _handle_order_msg(self, msg):
         """处理订单消息"""
         if not self._check_sequence(msg):
@@ -544,6 +535,11 @@ class AXOB():
         
         if self.SecurityIDSource == SecurityIDSource_SZSE:
             self.last_inc_applSeqNum = msg.ApplSeqNum
+
+    def _handleSignal(self, signal):
+        """处理交易信号"""
+        # 信号处理逻辑
+        pass
 
     def onMsg(self, msg):
         """优化的消息处理 - 减少重复判断"""
@@ -754,42 +750,6 @@ class AXOB():
                         self.enterCage()
 
                     self.genSnap()   #再出一个snap
-
-    def _insert_bid_order(self, order, outOfCage):
-        """插入买单"""
-        if order.price in self.bid_levels:
-            self.bid_levels[order.price].qty += order.qty
-            if order.price == self.bid_max_level_price:
-                self.bid_max_level_qty += order.qty
-        else:
-            self.bid_levels[order.price] = level_node(order.price, order.qty, order.applSeqNum)
-            self._bid_needs_sort = True
-            
-            if not outOfCage and (not self.bid_max_level_qty or order.price > self.bid_max_level_price):
-                self.bid_max_level_price = order.price
-                self.bid_max_level_qty = order.qty
-        
-        if not outOfCage:
-            self.BidWeightSize += order.qty
-            self.BidWeightValue += order.price * order.qty
-
-    def _insert_ask_order(self, order, outOfCage):
-        """插入卖单"""
-        if order.price in self.ask_levels:
-            self.ask_levels[order.price].qty += order.qty
-            if order.price == self.ask_min_level_price:
-                self.ask_min_level_qty += order.qty
-        else:
-            self.ask_levels[order.price] = level_node(order.price, order.qty, order.applSeqNum)
-            self._ask_needs_sort = True
-            
-            if not outOfCage and (not self.ask_min_level_qty or order.price < self.ask_min_level_price):
-                self.ask_min_level_price = order.price
-                self.ask_min_level_qty = order.qty
-        
-        if not outOfCage:
-            self.AskWeightSize += order.qty
-            self.AskWeightValue += order.price * order.qty
 
     def _insert_bid_level(self, order, outOfCage):
         """插入买单到价格档位"""
@@ -1071,7 +1031,7 @@ class AXOB():
         # order.qty -= Qty
         self.levelDequeue(side, order.price, Qty, appSeqNum)
 
-    def _updateBidMax(self):
+    def _update_bid_max(self):
         """更新买方最高价"""
         if self.bid_level_tree:
             self.bid_max_level_price = max(self.bid_level_tree.keys())
@@ -1121,7 +1081,7 @@ class AXOB():
             self.ERR(f'cancel AppSeqNum={cancel.applSeqNum} not found!')
             raise 'cancel AppSeqNum not found!'
         
-    def _updateAskMin(self):
+    def _update_ask_min(self):
         """更新卖方最低价"""
         if self.ask_level_tree:
             self.ask_min_level_price = min(self.ask_level_tree.keys())
